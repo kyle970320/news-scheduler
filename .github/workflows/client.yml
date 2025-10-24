@@ -1,0 +1,35 @@
+name: Deploy to S3 on Develop Push
+
+on:
+  # 1️⃣ 매시 정각 (UTC)
+  schedule:
+    - cron: "0 * * * *"
+
+  # 2️⃣ 수동 실행 버튼
+  workflow_dispatch: {}
+
+  # 3️⃣ main 브랜치에 push될 때 실행
+  push:
+    branches:
+      - main
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm ci
+
+      - run: npm start
+        env:
+          NEWS_API_BASE: ${{ secrets.NEWS_API_BASE }}
+          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
