@@ -170,10 +170,37 @@ function getDomain(url) {
 function sourceKindFromUrl(articleUrl) {
   const h = getDomain(articleUrl);
   if (!h) return "unknown";
-  if (/(prnewswire|businesswire|globenewswire|nasdaq\.com|newsfile|accesswire)/.test(h)) return "wire";
-  if (/(reuters|bloomberg|wsj|ft\.com|apnews|cnbc|marketwatch|forbes)/.test(h)) return "major_press";
-  if (/(medium\.com|substack|wordpress|blogspot)/.test(h)) return "blog";
-  if (/\.corp\.|\.ir\./.test(h)) return "company";
+
+  // Wire-type press releases
+  if (/(prnewswire|businesswire|globenewswire|accesswire|newsfile|nasdaq\.com)/.test(h)) {
+    return "wire";
+  }
+
+  // Major global business media
+  if (/(reuters|bloomberg|wsj\.com|ft\.com|apnews\.com|cnbc\.com|marketwatch\.com|forbes\.com|businessinsider\.com|barrons\.com|financialtimes\.com|seekingalpha\.com)/.test(h)) {
+    return "major_press";
+  }
+
+  // Regional / national press
+  if (/(nikkei\.com|theguardian\.com|bbc\.com|cnn\.com|abcnews\.go\.com|nbcnews\.com|telegraph\.co\.uk|economictimes\.indiatimes\.com|thehindu\.com|scmp\.com|afr\.com|straitstimes\.com)/.test(h)) {
+    return "regional_press";
+  }
+
+  // Financial portals / investor media
+  if (/(finance\.yahoo\.com|benzinga\.com|tipranks\.com|thestreet\.com|fxstreet\.com|investing\.com|marketscreener\.com|zacks\.com)/.test(h)) {
+    return "financial_portal";
+  }
+
+  // Corporate IR / company pages
+  if (/(\.ir\.|\.corp\.|investors\.|about\.|press\.|media\.)/.test(h)) {
+    return "company_ir";
+  }
+
+  // Blogs, forums, community
+  if (/(medium\.com|substack\.com|wordpress\.com|blogspot\.com|reddit\.com|stocktwits\.com|motleyfool\.com|discord\.gg)/.test(h)) {
+    return "blog_or_forum";
+  }
+
   return "unknown";
 }
 function eventKindFromKeywordsOrText(keywords, text) {
@@ -323,11 +350,13 @@ function logit(p) { return Math.log(p / (1 - p)); }
 
 function sourceTrust(source) {
   switch (source) {
-    case "wire":        return 0.80;
-    case "major_press": return 0.75;
-    case "company":     return 0.55;
-    case "blog":        return 0.50;
-    default:            return 0.50;
+    case "wire":             return 0.80;
+    case "major_press":      return 0.75;
+    case "regional_press":   return 0.68;
+    case "financial_portal": return 0.62;
+    case "company_ir":       return 0.55;
+    case "blog_or_forum":    return 0.45;
+    default:                 return 0.50;
   }
 }
 function eventWeight(event) {
