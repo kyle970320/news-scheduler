@@ -16,6 +16,20 @@ if (!API_BASE || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
 const TABLE = "news";
 const LIMIT = 300;
 
+async function cleanupOldNews(days = 2) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffISO = cutoff.toISOString();
+
+  console.log(`[CLEANUP] Deleting records older than ${cutoffISO}`);
+
+  const { error } = await supabase
+    .from(TABLE)
+    .delete()
+    .lt("created_at", cutoffISO); // published_utc이 cutoff보다 작은 데이터 삭제
+
+  if (error) throw error;
+}
 
 async function sendDiscord() {
   if (!DISCORD_WEBHOOK) {
@@ -108,6 +122,10 @@ async function insertChunked(rows, chunkSize = 100) {
 
 async function main() {
   const { gteISO } = lastHourWindow();
+  
+  //오래된 뉴스 정리
+  await cleanupOldNews(2);
+  
   const items = await fetchNews({ gteISO });     // 한 번에 300 요청
   if (!items?.length) {
     console.log(`[OK] No items. window=${gteISO}`);

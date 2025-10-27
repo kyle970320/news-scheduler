@@ -1,9 +1,8 @@
-name: Deploy to S3 on Develop Push
+name: news scheduler
 
 on:
-  # 1️⃣ 매시 정각 (UTC)
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/20 * * * *"   # 매 20분마다 (UTC 기준)
 
   # 2️⃣ 수동 실행 버튼
   workflow_dispatch: {}
