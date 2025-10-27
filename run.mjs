@@ -22,6 +22,58 @@ const ENABLE_SCORING = process.env.ENABLE_SCORING !== "false";
 // Upsert 기준 컬럼 (UNIQUE 인덱스 권장)
 const UPSERT_ON = process.env.UPSERT_ON || "article_url";
 
+// 신뢰도 가중치
+const ALERT_STRONG_SCORE = Number(process.env.ALERT_STRONG_SCORE ?? 60);
+const ALERT_STRONG_MODEL = Number(process.env.ALERT_STRONG_MODEL ?? 0.75);
+const ALERT_STRONG_RULE  = Number(process.env.ALERT_STRONG_RULE  ?? 0.70);
+const MAX_ALERT_ITEMS    = Number(process.env.MAX_ALERT_ITEMS ?? 8);
+
+
+// 신뢰도 계산 헬퍼
+function isStrongBullish(row) {
+  return (
+    typeof row.sentiment_score === "number" &&
+    row.sentiment_score >= ALERT_STRONG_SCORE &&
+    (row.sentiment_confidence_model ?? 0) >= ALERT_STRONG_MODEL &&
+    (row.sentiment_confidence_rule  ?? 0) >= ALERT_STRONG_RULE
+  );
+}
+
+function isStrongBearish(row) {
+  return (
+    typeof row.sentiment_score === "number" &&
+    row.sentiment_score <= -ALERT_STRONG_SCORE &&
+    (row.sentiment_confidence_model ?? 0) >= ALERT_STRONG_MODEL &&
+    (row.sentiment_confidence_rule  ?? 0) >= ALERT_STRONG_RULE
+  );
+}
+
+//알림 헬퍼
+function buildAlertMessage(bulls, bears) {
+  const header = `🚨 뉴스 알림 (호재/악재 컷오프 통과)\n` +
+    `• 기준: score≥${ALERT_STRONG_SCORE} |model≥${ALERT_STRONG_MODEL} |rule≥${ALERT_STRONG_RULE}\n`;
+
+  const fmt = (r) => {
+    const t = (r.title || "").slice(0, 120);
+    const u = r.article_url || "";
+    const s = r.sentiment_score;
+    const cm = (r.sentiment_confidence_model ?? 0).toFixed(2);
+    const cr = (r.sentiment_confidence_rule  ?? 0).toFixed(2);
+    const tick = Array.isArray(r.tickers) && r.tickers.length ? ` [${r.tickers.slice(0,4).join(",")}]` : "";
+    // 디스코드는 <url> 형식으로 링크가 잘 열림
+    return `• ${t}${tick}\n  score=${s}, cm=${cm}, cr=${cr}\n  <${u}>`;
+  };
+
+  const bullLines = bulls.slice(0, MAX_ALERT_ITEMS).map(fmt).join("\n\n");
+  const bearLines = bears.slice(0, MAX_ALERT_ITEMS).map(fmt).join("\n\n");
+
+  let body = "";
+  if (bulls.length) body += `\n🟩 강한 호재 ${bulls.length}건\n${bullLines}\n`;
+  if (bears.length) body += `\n🟥 강한 악재 ${bears.length}건\n${bearLines}\n`;
+
+  return header + (body || "\n(해당 없음)");
+}
+
 const TABLE = "news";
 const LIMIT = Number(process.env.NEWS_FETCH_LIMIT || 300);
 
@@ -549,7 +601,7 @@ async function runAll() {
 
   await upsertChunked(rows);
   console.log(`[OK] upserted=${rows.length} scope=ALL`);
-  return { inserted: rows.length, count: items.length };
+  return { rows, inserted: rows.length, count: items.length };
 }
 
 /** =========================
@@ -592,8 +644,16 @@ async function disableScoringForToday(reason = "quota/rate limit") {
  * ======================= */
 async function main() {
   await cleanupOldNews(2);
-  const { inserted, count } = await runAll();
-  await sendDiscord(`최신 뉴스가 갱신되었습니다! 수집:${count} / 저장:${inserted} (ALL; insight-level; neutral skipped)`);
+  const { rows, inserted, count } = await runAll();
+
+  const strongBulls = rows.filter(isStrongBullish);
+  const strongBears = rows.filter(isStrongBearish);
+
+  if (strongBulls.length || strongBears.length) {
+    const msg = buildAlertMessage(strongBulls, strongBears);
+    await sendDiscord(msg);
+  }
+   
   console.log(`[DONE] fetched=${count}, upserted=${inserted}, scope=ALL`);
 }
 
