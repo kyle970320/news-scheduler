@@ -500,7 +500,7 @@ async function scoreInsightsForRows(rows) {
 async function runAll() {
   console.log(`\n[RUN] scope=ALL limit=${LIMIT}`);
   const { gteISO } = lastHourWindow();
-  const items = await fetchNews(gteISO);
+  const items = await fetchNews({ gteISO });
   if (!items?.length) {
     console.log(`[RUN] No items.`);
     return { inserted: 0, count: 0 };
