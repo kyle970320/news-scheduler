@@ -4,7 +4,7 @@
   "type": "module",
   "version": "1.0.0",
   "scripts": {
-    "start": "node fetch.mjs"
+    "start": "node run.mjs"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

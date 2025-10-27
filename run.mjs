@@ -1,4 +1,4 @@
-// news_ingest_and_score.js
+// news_ingest_and_score_with_circuit_breaker_all_insights_filtered.js
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
@@ -14,10 +14,16 @@ const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 const DISCORD_WEBHOOK= process.env.DISCORD_WEBHOOK;
 
 // Gemini
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY; // 반드시 설정
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GEMINI_MODEL_ID = process.env.GEMINI_MODEL_ID || "gemini-2.0-flash-exp";
-const SCORE_BATCH_SIZE = Number(process.env.SCORE_BATCH_SIZE || 20); // 20 권장
-const ENABLE_SCORING = process.env.ENABLE_SCORING !== "false"; // 필요 시 끄기
+const SCORE_BATCH_SIZE = Number(process.env.SCORE_BATCH_SIZE || 20);
+const ENABLE_SCORING = process.env.ENABLE_SCORING !== "false";
+
+// Upsert 기준 컬럼 (UNIQUE 인덱스 권장)
+const UPSERT_ON = process.env.UPSERT_ON || "article_url";
+
+const TABLE = "news";
+const LIMIT = Number(process.env.NEWS_FETCH_LIMIT || 300);
 
 if (!API_BASE || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
   console.error("❌ Missing env (NEWS_API_BASE, SUPABASE_URL, SUPABASE_SERVICE_ROLE)");
@@ -28,9 +34,14 @@ if (ENABLE_SCORING && !GOOGLE_API_KEY) {
   process.exit(1);
 }
 
-const TABLE = "news";
-const LIMIT = 300;
+// ===== helpers =====
+const toISO = (d) => new Date(d).toISOString();
 
+function lastHourWindow() {
+  const now = new Date();
+  const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+  return { gteISO: toISO(oneHourAgo) };
+}
 /** =========================
  *  1) Supabase
  * ======================= */
@@ -58,15 +69,12 @@ async function cleanupOldNews(days = 2) {
 /** =========================
  *  3) Discord 알림
  * ======================= */
-async function sendDiscord() {
+async function sendDiscord(summaryText = "최신 뉴스가 갱신되었습니다!") {
   if (!DISCORD_WEBHOOK) {
     console.error("❌ Missing DISCORD_WEBHOOK");
     return;
   }
-  const payload = {
-    username: "호외요 호외",
-    content: "최신 뉴스가 갱신되었습니다!"
-  };
+  const payload = { username: "호외요 호외", content: summaryText };
   const res = await fetch(DISCORD_WEBHOOK, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -79,23 +87,13 @@ async function sendDiscord() {
 }
 
 /** =========================
- *  4) Helpers (시간/윈도우)
- * ======================= */
-const toISO = (d) => new Date(d).toISOString();
-function lastHourWindow() {
-  const now = new Date();
-  const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-  return { gteISO: toISO(oneHourAgo) };
-}
-
-/** =========================
- *  5) 외부 뉴스 API
+ *  4) 외부 뉴스 API (항상 전 종목)
  * ======================= */
 async function fetchNews({ gteISO, ticker = null }) {
   const url = new URL("/v2/reference/news", API_BASE);
   url.searchParams.set("sort", "published_utc");
   url.searchParams.set("order", "asc");
-  url.searchParams.set("limit", String(LIMIT));
+  url.searchParams.set("limit", LIMIT);
   url.searchParams.set("published_utc.gte", gteISO);
   if (ticker) url.searchParams.set("ticker", ticker);
   const headers = {};
@@ -111,7 +109,7 @@ async function fetchNews({ gteISO, ticker = null }) {
 }
 
 /** =========================
- *  6) 소스/이벤트 분류 (간단 규칙)
+ *  5) 소스/이벤트 분류 (간단 규칙)
  * ======================= */
 function getDomain(url) {
   try { return url ? new URL(url).hostname.toLowerCase() : ""; }
@@ -139,7 +137,7 @@ function eventKindFromKeywordsOrText(keywords, text) {
 }
 
 /** =========================
- *  7) 테이블 스키마 매핑 (+ 감정 필드)
+ *  6) 테이블 스키마 매핑 (+ insight 보존)
  * ======================= */
 function mapToRows(items) {
   return items.map((r) => {
@@ -148,7 +146,7 @@ function mapToRows(items) {
     const article_url = r.article_url ?? null;
     const published = r.published_utc ?? r.published_at ?? r.date ?? null;
     const tickers = Array.isArray(r.tickers) ? r.tickers : [];
-    const insights = r?.insights ?? {};
+    const insights = Array.isArray(r?.insights) ? r.insights : []; // ← 스키마 가정: [{ticker,sentiment,sentiment_reasoning}]
     const keywords = Array.isArray(r.keywords) ? r.keywords : [];
 
     return {
@@ -157,92 +155,100 @@ function mapToRows(items) {
       article_url,
       keywords,
       published_utc: published ? new Date(published).toISOString() : null,
-      insights,
+      insights,     // 원본 보존
       tickers,
-      // scoring fields
+      // 기사 롤업 필드
       sentiment_score: null,
       sentiment_confidence_model: null,
       sentiment_confidence_rule: null,
       sentiment_reasoning: null,
+      // insight 레벨 결과
+      sentiment_insights: null, // [{index, ticker, base_sentiment, text, score, conf_model, conf_rule, reasoning}]
     };
   });
 }
 
 /** =========================
- *  8) Gemini 배치 스코어링
+ *  7) Gemini — insight 단위 프롬프트
  * ======================= */
-const genAI = GOOGLE_API_KEY ? new GoogleGenerativeAI(GOOGLE_API_KEY) : null;
+const genAI = ENABLE_SCORING && GOOGLE_API_KEY ? new GoogleGenerativeAI(GOOGLE_API_KEY) : null;
 
-function buildPrompt(batch) {
+// 입력 스키마에 맞춰 insight 텍스트 구성
+function toInsightTextFromSchema(ins) {
+  // 안전 방어
+  const ticker = ins?.ticker ?? "";
+  const sentiment = ins?.sentiment ?? "";
+  const reason = ins?.sentiment_reasoning ?? "";
+  // 모델에 전달할 요약 텍스트
+  return `Sentiment=${sentiment}; Ticker=${ticker}; Rationale=${reason}`;
+}
+
+function buildPromptForInsights(batch) {
   const header = `
 You are a financial sentiment analyzer.
-For EACH article, assign a sentiment score from -100 (extremely negative) to +100 (extremely positive), 0 is neutral.
-Consider tone, language intensity, and potential market impact (lawsuits, FDA/M&A, earnings, guidance, partnerships, layoffs, accounting issues).
+Re-evaluate EACH INSIGHT (already labeled positive/negative) and assign a sentiment score from -100 to +100 (0=neutral) focused on market impact.
 Return ONLY a valid JSON array. No extra text.
 
 Rules:
-- "sentiment_score": integer in [-100, 100]
-- "confidence": float in [0, 1] with two decimals
-- "reasoning_summary": <= 25 words; concise and specific
+- "sentiment_score": integer [-100, 100]
+- "confidence": float [0, 1] with two decimals
+- "reasoning_summary": <= 25 words, in Korean, concise and specific
 - Preserve input order via "index"
 - If info is insufficient, use score 0 and confidence <= 0.40
 
 Output JSON schema:
 [
-  { "index": <number>, "ticker": "<string|null>", "sentiment_score": <int>, "confidence": <float>, "reasoning_summary": "<string>" },
+  { "index": <number>, "sentiment_score": <int>, "confidence": <float>, "reasoning_summary": "<string>" },
   ...
 ]
 `.trim();
 
-  const body = batch.map((a, i) => [
-    `--- ARTICLE ${i} ---`,
-    `Title: ${a.title ?? ""}`,
-    `Description: ${a.description ?? ""}`,
-    `Ticker: ${a.ticker ?? ""}`,
-    `Published UTC: ${a.published_utc ?? ""}`
+  const body = batch.map((u, i) => [
+    `--- INSIGHT ${i} ---`,
+    `ArticleTitle: ${u.articleTitle ?? ""}`,
+    `Insight: ${u.text ?? ""}`,
+    `Published UTC: ${u.published_utc ?? ""}`
   ].join("\n")).join("\n\n");
 
   return `${header}\n\n${body}\n\nReturn the JSON array now.`;
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function scoreBatchGemini(batch, attempt = 0) {
+async function scoreBatchGeminiInsights(batch, attempt = 0) {
   if (!genAI) throw new Error("Gemini not initialized");
   const model = genAI.getGenerativeModel({
     model: GEMINI_MODEL_ID,
-    generationConfig: {
-      temperature: 0.1,
-      responseMimeType: "application/json",
-    },
+    generationConfig: { temperature: 0.1, responseMimeType: "application/json" },
   });
-  const prompt = buildPrompt(batch);
+  const prompt = buildPromptForInsights(batch);
   try {
     const result = await model.generateContent(prompt);
     const text = result.response.text();
     const arr = safeExtractJsonArray(text);
     return arr.map((r, idx) => ({
       index: Number.isFinite(r?.index) ? r.index : idx,
-      ticker: r?.ticker ?? (batch[idx]?.ticker ?? null),
       sentiment_score: Math.max(-100, Math.min(100, Math.trunc(r?.sentiment_score ?? 0))),
       confidence: Math.max(0, Math.min(1, Number(r?.confidence ?? 0))),
       reasoning_summary: String(r?.reasoning_summary ?? "").slice(0, 300),
     }));
   } catch (e) {
     const msg = String(e?.message ?? e);
-    if (/(429|quota|rate|temporar|unavailable|5\d\d)/i.test(msg) && attempt < 4) {
+
+    if (/(rate|quota|exceed|429|insufficient|limit)/i.test(msg)) {
+      await disableScoringForToday(msg);
+      return batch.map((_, i) => ({
+        index: i, sentiment_score: 0, confidence: 0.3,
+        reasoning_summary: "Scoring disabled due to quota/limit."
+      }));
+    }
+    if (/5\d\d|temporar|unavailable/i.test(msg) && attempt < 4) {
       const backoff = Math.min(15000, 2000 * 2 ** attempt);
       console.warn(`[Gemini] retry in ${backoff}ms (attempt ${attempt+1}) :: ${msg}`);
       await sleep(backoff);
-      return scoreBatchGemini(batch, attempt + 1);
+      return scoreBatchGeminiInsights(batch, attempt + 1);
     }
     console.error(`[Gemini] failed: ${msg}`);
-    // 실패 시 뉴트럴 fallback
     return batch.map((_, i) => ({
-      index: i,
-      ticker: batch[i].ticker ?? null,
-      sentiment_score: 0,
-      confidence: 0.3,
+      index: i, sentiment_score: 0, confidence: 0.3,
       reasoning_summary: "Model error; defaulted to neutral."
     }));
   }
@@ -257,7 +263,7 @@ function safeExtractJsonArray(text) {
 }
 
 /** =========================
- *  9) 간이 보정 (pseudo-calibration)
+ *  8) 보정/롤업
  * ======================= */
 function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
@@ -269,7 +275,7 @@ function sourceTrust(source) {
     case "major_press": return 0.75;
     case "company":     return 0.55;
     case "blog":        return 0.50;
-    default:            return 0.50; // unknown
+    default:            return 0.50;
   }
 }
 function eventWeight(event) {
@@ -284,12 +290,10 @@ function eventWeight(event) {
     default:            return 0.55;
   }
 }
-
 function pseudoCalibrate(input, opts = {}) {
   const {
     k = 4, s0 = 0.5,
-    wIntensity = 1.0, wModel = 1.0, wSource = 0.7, wEvent = 0.8, wPrice = 0.5,
-    r0 = 0.02,
+    wIntensity = 1.0, wModel = 1.0, wSource = 0.7, wEvent = 0.8,
   } = opts;
 
   const score = Math.max(-100, Math.min(100, Math.trunc(input.sentiment_score)));
@@ -299,12 +303,6 @@ function pseudoCalibrate(input, opts = {}) {
   const p_source = clamp01(sourceTrust(input.source));
   const p_event  = clamp01(eventWeight(input.event));
 
-  let p_price;
-  if (typeof input.short_return_abs === "number") {
-    const r = Math.abs(input.short_return_abs);
-    p_price = clamp01(0.5 + 0.5 * Math.tanh(r / r0));
-  }
-
   const eps = 1e-6;
   const parts = [
     [p_intensity, wIntensity],
@@ -312,8 +310,6 @@ function pseudoCalibrate(input, opts = {}) {
     [p_source,    wSource],
     [p_event,     wEvent],
   ];
-  if (p_price !== undefined) parts.push([p_price, wPrice]);
-
   let num = 0, den = 0;
   for (const [p, w] of parts) {
     const pp = Math.min(1 - eps, Math.max(eps, p));
@@ -321,89 +317,284 @@ function pseudoCalibrate(input, opts = {}) {
     den += w;
   }
   const confidence_rule = clamp01(sigmoid(num / Math.max(den, 1e-6)));
+  const score_pseudo = Math.sign(score) * Math.round(Math.abs(score) * (0.5 + confidence_rule / 2));
+  return { confidence_rule, score_pseudo };
+}
 
-  const score_pseudo = Math.sign(score) * Math.round(
-    Math.abs(score) * (0.5 + confidence_rule / 2)
-  );
+function rollupArticleSentimentFromInsights(row) {
+  const srcKind = sourceKindFromUrl(row.article_url);
+  const evtKind = eventKindFromKeywordsOrText(row.keywords || [], `${row.title ?? ""} ${row.description ?? ""}`);
 
-  return { confidence_rule, score_pseudo, components: { p_intensity, p_model, p_source, p_event, ...(p_price !== undefined ? { p_price } : {}) } };
+  if (!Array.isArray(row.sentiment_insights) || row.sentiment_insights.length === 0) {
+    return null;
+  }
+
+  // 모델 컨피던스 기반 가중 평균
+  let num = 0, den = 0;
+  for (const si of row.sentiment_insights) {
+    const w = clamp01(Number(si.conf_model ?? 0.5));
+    num += w * si.score;
+    den += w;
+  }
+  const avgScore = den > 0 ? Math.round(num / den) : 0;
+
+  const { confidence_rule } = pseudoCalibrate({
+    sentiment_score: avgScore,
+    confidence_model: clamp01(row.sentiment_insights.reduce((a,b)=>a + (b.conf_model ?? 0.5), 0) / Math.max(1,row.sentiment_insights.length)),
+    source: srcKind,
+    event: evtKind,
+  });
+
+  const rolled = Math.sign(avgScore) * Math.round(Math.abs(avgScore) * (0.5 + confidence_rule / 2));
+  return {
+    score: rolled,
+    conf_model: clamp01(row.sentiment_insights.reduce((a,b)=>a + (b.conf_model ?? 0.5), 0) / Math.max(1,row.sentiment_insights.length)),
+    conf_rule: confidence_rule,
+    reasoning: "Insight-level rollup.",
+  };
 }
 
 /** =========================
- * 10) DB Insert (chunk)
+ *  9) DB Upsert (chunk)
  * ======================= */
-async function insertChunked(rows, chunkSize = 100) {
+async function upsertChunked(rows, chunkSize = 100) {
   for (let i = 0; i < rows.length; i += chunkSize) {
     const chunk = rows.slice(i, i + chunkSize);
-    const { error } = await supabase.from(TABLE).insert(chunk);
+    const { error } = await supabase
+      .from(TABLE)
+      .upsert(chunk, { onConflict: UPSERT_ON, ignoreDuplicates: true });
     if (error) throw error;
   }
 }
 
 /** =========================
- * 11) 전체 파이프라인
+ * 10) Insight 단위 확장/스코어/회수
  * ======================= */
-async function main() {
-  const { gteISO } = lastHourWindow();
+// neutral은 모델 X, positive/negative만 모델 태움
+function expandInsightUnits(rows) {
+  const units = []; // [{ rowIdx, insightIdx, text, articleTitle, published_utc }]
+  rows.forEach((row, rIdx) => {
+    const arr = Array.isArray(row.insights) ? row.insights : [];
+    if (!arr.length) return;
 
-  // 오래된 뉴스 삭제(생성일 기준)
-  await cleanupOldNews(2);
+    // 먼저 neutral들을 즉시 결과에 0점으로 기록(모델 미호출)
+    arr.forEach((ins, iIdx) => {
+      if (!ins) return;
+      const baseSent = String(ins.sentiment || "").toLowerCase();
+      if (baseSent === "neutral") {
+        row.sentiment_insights ||= [];
+        row.sentiment_insights[iIdx] = {
+          index: iIdx,
+          ticker: ins.ticker ?? null,
+          base_sentiment: baseSent,
+          text: toInsightTextFromSchema(ins),
+          score: 0,
+          conf_model: 0.0,
+          conf_rule: 0.0,
+          reasoning: "Neutral from source; model skipped."
+        };
+      }
+    });
 
-  // 뉴스 수집
-  const items = await fetchNews({ gteISO });
-  if (!items?.length) {
-    console.log(`[OK] No items. window=${gteISO}`);
+    // positive/negative만 큐에 올림
+    arr.forEach((ins, iIdx) => {
+      if (!ins) return;
+      const baseSent = String(ins.sentiment || "").toLowerCase();
+      if (baseSent === "positive" || baseSent === "negative") {
+        units.push({
+          rowIdx: rIdx,
+          insightIdx: iIdx,
+          text: toInsightTextFromSchema(ins),
+          articleTitle: row.title ?? "",
+          published_utc: row.published_utc ?? null,
+          base_sentiment: baseSent,
+          ticker: ins.ticker ?? (Array.isArray(row.tickers) && row.tickers[0] ? row.tickers[0] : null),
+        });
+      }
+    });
+  });
+  return units;
+}
+
+async function scoreInsightsForRows(rows) {
+  const units = expandInsightUnits(rows);
+  if (!units.length) return;
+
+  let disabled = ENABLE_SCORING ? await isScoringDisabled() : true;
+  if (disabled) {
+    console.warn("[SCORE] disabled (flag) — positive/negative insights neutral fallback.");
+    // 남은(모델 대상)들도 전부 뉴트럴로 채움
+    units.forEach((u) => {
+      const row = rows[u.rowIdx];
+      row.sentiment_insights ||= [];
+      row.sentiment_insights[u.insightIdx] = {
+        index: u.insightIdx,
+        ticker: u.ticker ?? null,
+        base_sentiment: u.base_sentiment,
+        text: u.text,
+        score: 0, conf_model: 0.3, conf_rule: 0.3,
+        reasoning: "Scoring disabled."
+      };
+    });
     return;
   }
 
-  // 기본 스키마 매핑
-  const rows = mapToRows(items);
+  // 배치 스코어링
+  for (let i = 0; i < units.length; i += SCORE_BATCH_SIZE) {
+    disabled = await isScoringDisabled();
+    if (disabled) {
+      console.warn("[SCORE] disabled mid-run — remaining insights neutral.");
+      for (let k = i; k < units.length; k++) {
+        const u = units[k];
+        const row = rows[u.rowIdx];
+        row.sentiment_insights ||= [];
+        row.sentiment_insights[u.insightIdx] = {
+          index: u.insightIdx,
+          ticker: u.ticker ?? null,
+          base_sentiment: u.base_sentiment,
+          text: u.text,
+          score: 0, conf_model: 0.3, conf_rule: 0.3,
+          reasoning: "Scoring disabled due to quota/limit."
+        };
+      }
+      break;
+    }
 
-  // 감정 스코어링 (배치)
-  if (ENABLE_SCORING) {
-    console.log(`[SCORE] Gemini scoring enabled. model=${GEMINI_MODEL_ID}, batch=${SCORE_BATCH_SIZE}`);
-    for (let i = 0; i < rows.length; i += SCORE_BATCH_SIZE) {
-      const slice = rows.slice(i, i + SCORE_BATCH_SIZE);
+    const slice = units.slice(i, i + SCORE_BATCH_SIZE);
+    const scored = await scoreBatchGeminiInsights(slice);
 
-      const batchInput = slice.map((r) => ({
-        title: r.title ?? "",
-        description: r.description ?? "",
-        ticker: (r.tickers && r.tickers[0]) || null,
-        published_utc: r.published_utc ?? null,
-      }));
+    // 결과 반영 + 룰 보정
+    scored.forEach((s, j) => {
+      const u = slice[j];
+      const row = rows[u.rowIdx];
+      const srcKind = sourceKindFromUrl(row.article_url);
+      const evtKind = eventKindFromKeywordsOrText(row.keywords || [], `${row.title ?? ""} ${row.description ?? ""}`);
 
-      const scored = await scoreBatchGemini(batchInput);
-
-      // 룰 기반 보정 병행
-      scored.forEach((s, j) => {
-        const row = slice[j];
-        const srcKind = sourceKindFromUrl(row.article_url);
-        const evtKind = eventKindFromKeywordsOrText(row.keywords || [], `${row.title ?? ""} ${row.description ?? ""}`);
-
-        const { confidence_rule } = pseudoCalibrate({
-          sentiment_score: s.sentiment_score,
-          confidence_model: s.confidence,
-          source: srcKind,
-          event: evtKind,
-          // short_return_abs: 0.0 // 있으면 넣기
-        });
-
-        row.sentiment_score = s.sentiment_score;
-        row.sentiment_confidence_model = s.confidence;
-        row.sentiment_confidence_rule = confidence_rule;
-        row.sentiment_reasoning = s.reasoning_summary;
+      const { confidence_rule } = pseudoCalibrate({
+        sentiment_score: s.sentiment_score,
+        confidence_model: s.confidence,
+        source: srcKind,
+        event: evtKind,
       });
 
-      console.log(`[SCORE] Scored rows ${i} ~ ${Math.min(i + SCORE_BATCH_SIZE - 1, rows.length - 1)}`);
-    }
-  } else {
-    console.log(`[SCORE] Skipped (ENABLE_SCORING=false).`);
+      row.sentiment_insights ||= [];
+      row.sentiment_insights[u.insightIdx] = {
+        index: u.insightIdx,
+        ticker: u.ticker ?? null,
+        base_sentiment: u.base_sentiment, // 원본 레이블 보존
+        text: u.text,
+        score: s.sentiment_score,
+        conf_model: s.confidence,
+        conf_rule: confidence_rule,
+        reasoning: s.reasoning_summary,
+      };
+    });
+
+    console.log(`[SCORE] Insight rows ${i} ~ ${Math.min(i + SCORE_BATCH_SIZE - 1, units.length - 1)}`);
+  }
+}
+
+/** =========================
+ * 11) 실행 (전 종목 + insight 단위, neutral 제외)
+ * ======================= */
+async function runAll() {
+  console.log(`\n[RUN] scope=ALL limit=${LIMIT}`);
+  const { gteISO } = lastHourWindow();
+  const items = await fetchNews(gteISO);
+  if (!items?.length) {
+    console.log(`[RUN] No items.`);
+    return { inserted: 0, count: 0 };
   }
 
-  // DB 저장
-  await insertChunked(rows);
-  await sendDiscord();
-  console.log(`[OK] inserted=${rows.length} window=${gteISO}`);
+  const rows = mapToRows(items);
+
+  if (ENABLE_SCORING) {
+    await scoreInsightsForRows(rows);
+
+    // insight 기반 기사 롤업
+    rows.forEach((row) => {
+      const roll = rollupArticleSentimentFromInsights(row);
+      if (roll) {
+        row.sentiment_score = roll.score;
+        row.sentiment_confidence_model = roll.conf_model;
+        row.sentiment_confidence_rule = roll.conf_rule;
+        row.sentiment_reasoning = roll.reasoning;
+      } else {
+        if (row.sentiment_score === null) {
+          row.sentiment_score = 0;
+          row.sentiment_confidence_model = 0.0;
+          row.sentiment_confidence_rule = 0.0;
+          row.sentiment_reasoning = "No insights to score (neutral).";
+        }
+      }
+    });
+  } else {
+    // 전체 스코어링 비활성
+    rows.forEach((row) => {
+      const arr = Array.isArray(row.insights) ? row.insights : [];
+      row.sentiment_insights = arr.map((ins, idx) => ({
+        index: idx,
+        ticker: ins?.ticker ?? null,
+        base_sentiment: ins?.sentiment ?? null,
+        text: toInsightTextFromSchema(ins),
+        score: 0, conf_model: 0.0, conf_rule: 0.0,
+        reasoning: "Scoring skipped."
+      }));
+      row.sentiment_score = 0;
+      row.sentiment_confidence_model = 0.0;
+      row.sentiment_confidence_rule = 0.0;
+      row.sentiment_reasoning = "Scoring skipped.";
+    });
+  }
+
+  await upsertChunked(rows);
+  console.log(`[OK] upserted=${rows.length} scope=ALL`);
+  return { inserted: rows.length, count: items.length };
+}
+
+/** =========================
+ * 12) 회로차단/유틸
+ * ======================= */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function getNextPstMidnight() {
+  const now = new Date();
+  const next = new Date();
+  next.setUTCHours(8, 0, 0, 0);
+  if (now >= next) next.setUTCDate(next.getUTCDate() + 1);
+  return next;
+}
+async function isScoringDisabled() {
+  const { data, error } = await supabase
+    .from("google_flag")
+    .select("value")
+    .eq("key", "scoring")
+    .single();
+  if (error && error.code !== "PGRST116") {
+    console.warn("[FLAGS] read error", error.message);
+  }
+  const disabledUntilISO = data?.value?.disabled_until;
+  if (!disabledUntilISO) return false;
+  return new Date() < new Date(disabledUntilISO);
+}
+async function disableScoringForToday(reason = "quota/rate limit") {
+  const untilISO = getNextPstMidnight().toISOString();
+  const payload = { disabled_until: untilISO, reason };
+  const { error } = await supabase
+    .from("google_flag")
+    .upsert({ key: "scoring", value: payload, updated_at: new Date().toISOString() });
+  if (error) console.warn("[FLAGS] upsert error", error.message);
+  console.warn(`[SCORE] disabled until PST midnight (${untilISO}) :: ${reason}`);
+}
+
+/** =========================
+ * 13) 엔트리포인트
+ * ======================= */
+async function main() {
+  await cleanupOldNews(2);
+  const { inserted, count } = await runAll();
+  await sendDiscord(`최신 뉴스가 갱신되었습니다! 수집:${count} / 저장:${inserted} (ALL; insight-level; neutral skipped)`);
+  console.log(`[DONE] fetched=${count}, upserted=${inserted}, scope=ALL`);
 }
 
 main().catch((e) => {

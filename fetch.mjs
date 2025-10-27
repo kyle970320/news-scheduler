@@ -64,7 +64,6 @@ function lastHourWindow() {
 async function fetchNews({ gteISO, ticker = null }) {
   const url = new URL("/v2/reference/news", API_BASE);
   url.searchParams.set("sort", "published_utc");
-  url.searchParams.set("sort", "published_utc");
   url.searchParams.set("order", "asc");
   url.searchParams.set("limit", LIMIT);
   url.searchParams.set("published_utc.gte", gteISO);
