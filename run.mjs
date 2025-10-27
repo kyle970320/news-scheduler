@@ -148,16 +148,47 @@ async function fetchNews({ gteISO, ticker = null }) {
   url.searchParams.set("limit", LIMIT);
   url.searchParams.set("published_utc.gte", gteISO);
   if (ticker) url.searchParams.set("ticker", ticker);
+
   const headers = {};
   if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`;
 
+  // 1️⃣ 외부 뉴스 API 호출
   const res = await fetch(url.toString(), { headers });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`News API ${res.status}: ${body}`);
   }
   const json = await res.json();
-  return json.results || [];
+  const items = json.results || [];
+  if (!items.length) return [];
+
+  // 2️⃣ DB에 이미 있는 기사 URL 목록 불러오기
+  const urls = items
+    .map((n) => n.article_url?.trim())
+    .filter((u) => !!u);
+
+  const { data: existing, error } = await supabase
+    .from("news")
+    .select("article_url")
+    .in("article_url", urls);
+
+  if (error) {
+    console.error("[fetchNews] failed to check duplicates:", error);
+    throw error;
+  }
+
+  const existingUrls = new Set(existing?.map((r) => r.article_url));
+
+  // 3️⃣ 중복 제거
+  const filtered = items.filter(
+    (n) => !existingUrls.has(n.article_url?.trim())
+  );
+
+  console.log(
+    `[fetchNews] total=${items.length} duplicates=${items.length - filtered.length} inserted=${filtered.length}`
+  );
+
+  return filtered;
 }
 
 /** =========================
