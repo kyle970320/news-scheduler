@@ -646,14 +646,14 @@ async function main() {
   await cleanupOldNews(2);
   const { rows, inserted, count } = await runAll();
 
-  const strongBulls = rows.filter(isStrongBullish);
-  const strongBears = rows.filter(isStrongBearish);
+  const strongBulls = rows?.filter(isStrongBullish) ?? [];
+  const strongBears = rows?.filter(isStrongBearish) ?? [];
 
   if (strongBulls.length || strongBears.length) {
     const msg = buildAlertMessage(strongBulls, strongBears);
     await sendDiscord(msg);
   }
-   
+
   console.log(`[DONE] fetched=${count}, upserted=${inserted}, scope=ALL`);
 }
 
