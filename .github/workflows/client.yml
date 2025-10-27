@@ -32,3 +32,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GEMINI_MODEL_ID: ${{ secrets.GEMINI_MODEL_ID }}
+          SCORE_BATCH_SIZE: ${{ secrets.SCORE_BATCH_SIZE }}
+          ENABLE_SCORING: ${{ secrets.ENABLE_SCORING }}
+          UPSERT_ON: ${{ secrets.UPSERT_ON }}
