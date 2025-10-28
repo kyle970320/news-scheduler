@@ -49,19 +49,29 @@ function isStrongBearish(row) {
 }
 
 //알림 헬퍼
-function buildAlertMessage(bulls, bears) {
-  const header = `🚨 뉴스 알림 (호재/악재 컷오프 통과)\n` +
-    `• 기준: score≥${ALERT_STRONG_SCORE} |model≥${ALERT_STRONG_MODEL} |rule≥${ALERT_STRONG_RULE}\n`;
+function buildAlertMessage(bulls, bears, upsertData, homepageUrl) {
+  const header = `🚨 뉴스 알림 (호재/악재 컷오프 통과)\n`;
+    // `• 기준: score≥${ALERT_STRONG_SCORE} |model≥${ALERT_STRONG_MODEL} |rule≥${ALERT_STRONG_RULE}\n`;
 
-  const fmt = (r) => {
+ const fmt = (r) => {
     const t = (r.title || "").slice(0, 120);
-    const u = r.article_url || "";
     const s = r.sentiment_score;
     const cm = (r.sentiment_confidence_model ?? 0).toFixed(2);
-    const cr = (r.sentiment_confidence_rule  ?? 0).toFixed(2);
-    const tick = Array.isArray(r.tickers) && r.tickers.length ? ` [${r.tickers.slice(0,4).join(",")}]` : "";
+    const cr = (r.sentiment_confidence_rule ?? 0).toFixed(2);
+    const tick =
+      Array.isArray(r.tickers) && r.tickers.length
+        ? ` [${r.tickers.slice(0, 4).join(",")}]`
+        : "";
+
+    // upsertData에서 같은 article_url을 가진 항목 찾기
+    const matched = upsertData.find((u) => u.article_url === r.article_url);
+    // 있으면 내부 링크, 없으면 원본 URL
+    const link = matched
+      ? `${homepageUrl.replace(/\/$/, "")}/${matched.id}`
+      : r.article_url || "";
+
     // 디스코드는 <url> 형식으로 링크가 잘 열림
-    return `• ${t}${tick}\n  score=${s}, cm=${cm}, cr=${cr}\n  <${u}>`;
+    return `• ${t}${tick}\n  score=${s}, cm=${cm}, cr=${cr}\n  <${link}>`;
   };
 
   const bullLines = bulls.slice(0, MAX_ALERT_ITEMS).map(fmt).join("\n\n");
@@ -472,10 +482,14 @@ function rollupArticleSentimentFromInsights(row) {
 async function upsertChunked(rows, chunkSize = 100) {
   for (let i = 0; i < rows.length; i += chunkSize) {
     const chunk = rows.slice(i, i + chunkSize);
-    const { error } = await supabase
-      .from(TABLE)
-      .upsert(chunk, { onConflict: UPSERT_ON, ignoreDuplicates: true });
-    if (error) throw error;
+const { data, error } = await supabase
+  .from(TABLE)
+  .upsert(chunk, { onConflict: UPSERT_ON, ignoreDuplicates: true })
+  .select();
+    if (error){ 
+        throw error
+    };
+    return {upsertData : data }
   }
 }
 
@@ -659,9 +673,9 @@ async function runAll() {
     });
   }
 
-  await upsertChunked(rows);
+  const {upsertData} = await upsertChunked(rows);
   console.log(`[OK] upserted=${rows.length} scope=ALL`);
-  return { rows, inserted: rows.length, count: items.length };
+  return { rows, upsertData, inserted: rows.length, count: items.length };
 }
 
 /** =========================
@@ -704,13 +718,13 @@ async function disableScoringForToday(reason = "quota/rate limit") {
  * ======================= */
 async function main() {
   await cleanupOldNews(2);
-  const { rows, inserted, count } = await runAll();
+  const { rows, upsertData, inserted, count } = await runAll();
 
   const strongBulls = rows?.filter(isStrongBullish) ?? [];
   const strongBears = rows?.filter(isStrongBearish) ?? [];
 
   if (strongBulls.length || strongBears.length) {
-    const msg = buildAlertMessage(strongBulls, strongBears);
+    const msg = buildAlertMessage(strongBulls, strongBears, upsertData,'https://news-dashboard-fawn-nu.vercel.app');
     await sendDiscord(msg);
   }
 
