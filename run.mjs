@@ -136,15 +136,44 @@ async function sendDiscord(summaryText = "최신 뉴스가 갱신되었습니다
     console.error("❌ Missing DISCORD_WEBHOOK");
     return;
   }
-  const payload = { username: "호외요 호외", content: summaryText };
-  const res = await fetch(DISCORD_WEBHOOK, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Discord error: ${res.status} ${t}`);
+
+  // 디스코드 메시지는 content 최대 2000자 제한
+  const MAX_LEN = 2000;
+  const chunks = [];
+
+  if (summaryText.length <= MAX_LEN) {
+    chunks.push(summaryText);
+  } else {
+    // \n 단위로 잘라서 최대 2000자씩 분할
+    let buffer = "";
+    for (const line of summaryText.split("\n")) {
+      if ((buffer + "\n" + line).length > MAX_LEN) {
+        chunks.push(buffer);
+        buffer = line;
+      } else {
+        buffer += (buffer ? "\n" : "") + line;
+      }
+    }
+    if (buffer) chunks.push(buffer);
+  }
+
+  // 순차적으로 전송
+  for (const [i, chunk] of chunks.entries()) {
+    const payload = {
+      username: "호외요 호외",
+      content: chunk + (chunks.length > 1 ? `\n\n(${i + 1}/${chunks.length})` : "")
+    };
+
+    const res = await fetch(DISCORD_WEBHOOK, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`Discord error: ${res.status} ${t}`);
+    }
   }
 }
 
