@@ -30,22 +30,38 @@ const MAX_ALERT_ITEMS    = Number(process.env.MAX_ALERT_ITEMS ?? 8);
 
 
 // 신뢰도 계산 헬퍼
-function isStrongBullish(row) {
-  return (
-    typeof row.sentiment_score === "number" &&
-    row.sentiment_score >= ALERT_STRONG_SCORE &&
-    (row.sentiment_confidence_model ?? 0) >= ALERT_STRONG_MODEL &&
-    (row.sentiment_confidence_rule  ?? 0) >= ALERT_STRONG_RULE
-  );
+function hasStrongBullish(row) {
+    const insights = row?.sentiment_insights
+    const filterdInsights = insights?.filter((el) => el.base_sentiment !=='neutral')
+    if(filterdInsights?.length < 1){
+        return false
+    }
+    const hasStrongInsight = filterdInsights?.some((el)=>{
+        return (
+          typeof el.score === "number" &&
+          el.score >= ALERT_STRONG_SCORE &&
+          (el.conf_model ?? 0) >= ALERT_STRONG_MODEL &&
+          (el.conf_rule  ?? 0) >= ALERT_STRONG_RULE
+        );
+    })
+    return hasStrongInsight ?? false
 }
 
-function isStrongBearish(row) {
-  return (
-    typeof row.sentiment_score === "number" &&
-    row.sentiment_score <= -ALERT_STRONG_SCORE &&
-    (row.sentiment_confidence_model ?? 0) >= ALERT_STRONG_MODEL &&
-    (row.sentiment_confidence_rule  ?? 0) >= ALERT_STRONG_RULE
-  );
+function hasStrongBearish(row) {
+    const insights = row?.sentiment_insights
+    const filterdInsights = insights?.filter((el) => el.base_sentiment !=='neutral')
+    if(filterdInsights?.length < 1){
+        return false
+    }
+    const hasStrongInsight = filterdInsights?.some((el)=>{
+        return (
+          typeof el.score === "number" &&
+          el.score <= -ALERT_STRONG_SCORE &&
+          (el.conf_model ?? 0) >= ALERT_STRONG_MODEL &&
+          (el.conf_rule  ?? 0) >= ALERT_STRONG_RULE
+        );
+    })
+    return hasStrongInsight ?? false
 }
 
 //알림 헬퍼
@@ -749,8 +765,8 @@ async function main() {
   await cleanupOldNews(2);
   const { rows, upsertData, inserted, count } = await runAll();
 
-  const strongBulls = rows?.filter(isStrongBullish) ?? [];
-  const strongBears = rows?.filter(isStrongBearish) ?? [];
+  const strongBulls = rows?.filter(hasStrongBullish) ?? [];
+  const strongBears = rows?.filter(hasStrongBearish) ?? [];
 
   if (strongBulls.length || strongBears.length) {
     const msg = buildAlertMessage(strongBulls, strongBears, upsertData,'https://news-dashboard-fawn-nu.vercel.app');
