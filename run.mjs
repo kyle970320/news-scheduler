@@ -672,6 +672,7 @@ async function runAll() {
   console.log(`\n[RUN] scope=ALL limit=${LIMIT}`);
   const { gteISO } = lastHourWindow();
   const items = await fetchNews({ gteISO });
+ 
   if (!items?.length) {
     console.log(`[RUN] No items.`);
     return { inserted: 0, count: 0 };
@@ -762,9 +763,9 @@ async function disableScoringForToday(reason = "quota/rate limit") {
  * 13) 엔트리포인트
  * ======================= */
 async function main() {
-  await cleanupOldNews(2);
+  await cleanupOldNews(7);
   const { rows, upsertData, inserted, count } = await runAll();
-
+  console.log(rows)
   const strongBulls = rows?.filter(hasStrongBullish) ?? [];
   const strongBears = rows?.filter(hasStrongBearish) ?? [];
 
